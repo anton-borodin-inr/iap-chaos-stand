@@ -4,24 +4,17 @@ Status: stage 0 contract. Frozen at tag `stand-v1`.
 
 This document defines how the reference client and server behave at every step of the purchase flow and of the other network calls. It covers what happens when the network or the app fails. Request and response shapes are in [openapi.yaml](openapi.yaml). UI identifiers are in [ui-ids.md](ui-ids.md). Invariants are in [invariants.md](invariants.md).
 
-## 1. Fault model and guarantee
+## 1. Assumptions and guarantee
 
-**Guarantee.** Under any single fault from the list below, the reference stand keeps every invariant I1–I10. "After recovery" invariants are checked once the recovery sequence of [invariants.md](invariants.md#recovery) has run. A single fault may hit any one request or response, including a retry. The app may also be killed or restarted once.
+The reference does not rely on the network or on the app process. For any single call it assumes only this:
 
-| Fault | Meaning |
-| --- | --- |
-| Request lost | The request never reaches the server. The server did nothing. |
-| Response lost | The server processed the request, and the client gets no response (connection reset or timeout). |
-| Duplicated request | The server receives the same request twice, sequentially or concurrently. |
-| Delay below timeout | A request or response is delayed by less than the client call timeout. |
-| Delay above timeout | A request or response is delayed past the client call timeout. A delayed request may still reach the server later. |
-| Error status | An intermediary returns an HTTP error code (4xx or 5xx) instead of the server's response. The server may or may not have processed the request. |
-| Stale response | The client receives a response recorded earlier, possibly for a different request or player. |
-| Corrupted response | The response body is truncated, is not JSON, or has fields changed or removed. |
-| App backgrounded | The app goes to the background at any point and comes back. |
-| App killed | The app process is killed at any point and started again later. |
+- **Delivery.** The server may process a request zero times, once or more than once, at any later moment, including after the client stopped waiting for it.
+- **Observation.** The client observes an accepted response, an error response or no usable response. That observation does not have to match what the server did: an error or no response may follow successful processing, and a well-formed response may belong to a different request or player.
+- **Process.** The app may leave the foreground, or be stopped at any point and started again later.
 
-**Not covered.** Semantic changes to *request* bodies are not covered: the server cannot tell such a request from a real one. The reference still rejects forged or altered receipts (I7). One known consequence: raising `taps` in a `POST /taps/sync` request violates I10 on the reference.
+**Guarantee.** If at most one exchange of a scenario (one attempt of one call) departs from normal delivery, and the app is stopped at most once, the reference keeps every invariant I1–I10. "After recovery" invariants are checked once the recovery sequence of [invariants.md](invariants.md#recovery) has run.
+
+**Trust boundary.** The server takes a well-formed, authenticated request at its word, except for receipts, which it verifies by signature (I7). In particular, it credits the tap count a batch reports. I10 relies on that count matching the taps made.
 
 ## 2. Client network policy
 
@@ -239,44 +232,35 @@ At most one `purchase_grant` journal entry exists per `transaction_id`. A unique
 
 ## 11. Failure matrix: purchase flow
 
-"Retry" means the next attempt under the policy of §2. "Recovery" means the next pending recovery (in this action or at startup). All outcomes keep I1–I10.
+The matrix is organized by what the client observes, because that is all the client can act on. "No usable response" means a connection error, a timeout, `408`, `429`, `5xx`, or a `2xx` that fails the [acceptance rules](#3-response-acceptance-rules). "Retry" means the next attempt under the policy of §2. "Recovery" means the next pending recovery (in this action or at startup). Every row keeps I1–I10, whatever the server actually did.
 
-| Step | Fault | Server effect | Correct client behavior |
+| Step | Client observes | Possible server state | Correct client behavior |
 | --- | --- | --- | --- |
-| `POST /store/purchases` | Request lost | None | Retry with the same key |
-| | Response lost | Transaction created | Retry with the same key returns the same transaction (`200`) |
-| | Duplicated | One transaction | The second request returns the same transaction |
-| | Delay above timeout | Created when the request arrives | Retry. Whichever request comes second returns the same transaction |
-| | 5xx or 408/429 status | Maybe created | Retry with the same key |
-| | Other 4xx status | Maybe created | Error `rejected`. Retry tap reuses the key; otherwise startup recovery grants any created transaction |
-| | 409 status | Maybe created | Recovery. If it grants this SKU: Success; otherwise Error `already_purchased` |
-| | Stale response | Maybe created | `idempotency_key` mismatch: invalid response, retry |
-| | Corrupted response | Created | Invalid response, retry with the same key |
-| `POST /purchases/validate` | Request lost | None | Retry |
-| | Response lost | Granted | Retry returns `duplicate: true`, Success |
-| | Duplicated | One grant | Second returns `duplicate: true` |
-| | Delay above timeout | Granted when it arrives | Retry. The later request gets `duplicate: true` |
-| | 5xx or 408/429 status | Maybe granted | Retry |
-| | 400 status with a receipt error code | Maybe granted | Refetch, then validate again |
-| | Other 4xx status | Maybe granted | Error `rejected` (allowed by I9). Recovery acknowledges later |
-| | Stale response | Maybe granted | `transaction_id` mismatch: invalid response, retry |
-| | Corrupted response | Granted | Invalid response, retry, `duplicate: true` |
-| Store response with a broken receipt | Altered payload or signature | Transaction is fine | Validate returns `400`, refetch gets the original receipt, validate grants |
-| `GET /store/purchases/{id}` (refetch) | Any | None | Retry. If retries run out: Error `unavailable`, and recovery finishes it |
-| `POST .../acknowledge` | Any | Maybe acknowledged | Retry in the background. If retries run out, the transaction stays pending and startup recovery acknowledges it (validate returns `duplicate: true` first) |
-| `GET /store/purchases?status=pending` | Any | None | Retry. If retries run out: `sync_status` `error`, automatic retry |
+| `POST /store/purchases` | No usable response | No transaction, or exactly one for this key | Retry with the same key. When retries run out: Error `unavailable`; the retry tap reuses the key |
+| | `409` | A one-time transaction may exist under another key | Recovery. If it grants this SKU: Success; otherwise Error `already_purchased` |
+| | Other final 4xx | No transaction, or one for this key | Error `rejected`, key kept. The retry tap reuses the key; otherwise startup recovery grants any created transaction |
+| | Accepted response | One transaction for this key | Persist it, go to Validate |
+| `POST /purchases/validate` | No usable response | Not granted, or granted once | Retry. A later `200` may carry `duplicate: true`; both mean Success |
+| | `400` with a receipt error code | Not granted, or granted once | Refetch, then validate once more |
+| | Other final 4xx | Not granted, or granted once | Error `rejected` (allowed by I9). Recovery grants or confirms the grant, then acknowledges |
+| | Accepted response | Granted once | Success |
+| `GET /store/purchases/{id}` (refetch) | Anything but an accepted response | Unchanged | Retry. When retries run out: Error `unavailable`; recovery finishes it |
+| `POST .../acknowledge` | Anything but an accepted response | Pending or acknowledged | Retry in the background. When retries run out, the transaction stays pending and startup recovery acknowledges it (validate returns `duplicate: true` first) |
+| `GET /store/purchases?status=pending` | Anything but an accepted response | Unchanged | Retry. When retries run out: `sync_status` `error`, automatic retry |
+
+A receipt that reaches the client altered fails validation with `400`. The refetch returns the store's original receipt, and validation then grants.
 
 ## 12. Failure behavior of other calls
 
-| Call | Request or response lost, duplicated, delayed, 5xx | Final 4xx | Stale or corrupted response |
-| --- | --- | --- | --- |
-| `POST /players` | Retry. Idempotent by `install_id` | Startup step fails, `sync_status` `error` | Invalid response, retry |
-| `GET /player` | Retry | `sync_status` `error` | Invalid response, retry. An older `version` is ignored |
-| `GET /catalog` | Retry | `catalog_state` `error` | Invalid response, retry |
-| `POST /taps/sync` | Retry with the same `batch_id` | See §8 | Invalid response, retry |
-| `POST /spend` | Retry with the same `spend_id` | Error with the mapped code | Invalid response, retry |
+| Call | No usable response | Final 4xx |
+| --- | --- | --- |
+| `POST /players` | Retry. Idempotent by `install_id` | Startup step fails, `sync_status` `error` |
+| `GET /player` | Retry. A snapshot with an older `version` is ignored | `sync_status` `error` |
+| `GET /catalog` | Retry | `catalog_state` `error` |
+| `POST /taps/sync` | Retry with the same `batch_id` | See §8 |
+| `POST /spend` | Retry with the same `spend_id` | Error with the mapped code |
 
-A stale catalog can show an expired or already bought offer as available. Buying it then either succeeds, because a paid purchase is always granted, or ends in `already_purchased` after recovery. Neither is a violation.
+An outdated catalog can show an expired or already bought offer as available. Buying it then either succeeds, because a paid purchase is always granted, or ends in `already_purchased` after recovery. Neither is a violation.
 
 ## 13. App killed during the purchase flow
 

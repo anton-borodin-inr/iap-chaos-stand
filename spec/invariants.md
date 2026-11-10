@@ -2,7 +2,7 @@
 
 Status: stage 0 contract. Frozen at tag `stand-v1`.
 
-These are the economy and UI invariants of the stand, written as checks. Breaking any of them is a finding. The reference stand keeps all of them under the fault model of [purchase-flow.md](purchase-flow.md#1-fault-model-and-guarantee).
+These are the economy and UI invariants of the stand, written as checks. Breaking any of them is a finding. The reference stand keeps all of them under the fault model of [purchase-flow.md](purchase-flow.md#1-assumptions-and-guarantee).
 
 ## Data sources
 
@@ -30,7 +30,7 @@ If the scenario itself killed or restarted the app during an action, that action
 
 ### Recovery
 
-1. Remove the fault: the proxy forwards traffic unchanged from now on.
+1. Remove the fault: from now on, every call is delivered and answered normally.
 2. Wait P1 = 5 s.
 3. Restart the app: force-stop, then launch without extras (see [launch.md](launch.md#restart)).
 4. Wait until `sync_status` = `idle`, polling, for at most R = 60 s.
@@ -139,7 +139,7 @@ If step 4 times out, I8c is violated, and I4 is reported as not evaluated (it is
 - **When:** `imm`, `rec`.
 - **Counters come from the flow.** `F.buy_presses` and `F.taps_made` are not available through the audit API or the screen. Whoever runs the flow must count its own taps and supply them. Retry, dismiss and navigation taps are not counted.
 - **Why taps are counted, not coins:** a journal `tap_batch` entry stores the raw tap count, so the comparison does not depend on booster charges or level.
-- **Known gap:** the reference violates I10 if a request body's `taps` is raised in transit (see [purchase-flow.md §1](purchase-flow.md#1-fault-model-and-guarantee)).
+- **Trust boundary:** the server credits the tap count a batch reports (see [purchase-flow.md §1](purchase-flow.md#1-assumptions-and-guarantee)). A batch whose count differs from the taps actually made breaks I10 even on the reference.
 
 ## Checkability summary
 
