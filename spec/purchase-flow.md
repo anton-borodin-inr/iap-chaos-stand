@@ -211,7 +211,7 @@ There are no other states and no transitions back. A transaction is never delete
 not granted --validate (valid receipt)--> granted
 ```
 
-At most one `purchase_grant` journal entry exists per `transaction_id`. A unique constraint enforces this.
+At most one `purchase_grant` journal entry exists per `transaction_id`.
 
 ### Combined state
 
@@ -225,7 +225,7 @@ At most one `purchase_grant` journal entry exists per `transaction_id`. A unique
 ### Server requirements
 
 - Every mutating request runs in one SQLite transaction (`BEGIN IMMEDIATE`). Balance changes and journal entries are committed together.
-- Idempotency keys are protected by unique constraints, so concurrent duplicates cannot both apply.
+- The idempotency lookup and the write it guards run in the same serialized write transaction, so concurrent duplicates cannot both apply.
 - Balances are stored as columns on the player row, separately from the journal. They are never computed from the journal at read time.
 - `starter_offer` is unique per player in the store (partial unique index on `(player_id, sku)` for one-time SKUs).
 - No mutating request has a partial effect. On error, nothing is committed.

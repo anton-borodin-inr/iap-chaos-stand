@@ -8,7 +8,7 @@ This is how to start, reset and restart the stand, and how to enable defects. Th
 
 | Artifact | Name | Notes |
 | --- | --- | --- |
-| Server image | `iap-chaos-stand/server:stand-v1` | Backend and store in one container. Built with `docker build -t iap-chaos-stand/server:stand-v1 server/` or loaded with `docker load` |
+| Server image | `iap-chaos-stand/server:stand-v1` | Backend and store in one container. Built from the repository root with `docker build -f server/Dockerfile -t iap-chaos-stand/server:stand-v1 .`, or loaded with `docker load` |
 | Compose file | `compose.yaml` (repository root) | References the image by tag only. It has no `build:` section, so `up` never rebuilds from source |
 | Android app | `stand-v1.apk`, package `dev.iapchaos.stand`, activity `.MainActivity` | Debug build. Cleartext HTTP is allowed to any host |
 

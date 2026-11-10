@@ -1,0 +1,23 @@
+# Contract: spec/launch.md. Start with:
+#   STAND_DEFECTS=<ids> docker compose up -d --wait
+services:
+  server:
+    image: iap-chaos-stand/server:stand-v1
+    pull_policy: never
+    ports:
+      - "8080:8080"
+      - "127.0.0.1:8090:8090"
+    environment:
+      STAND_DEFECTS: ${STAND_DEFECTS:-}
+      RECEIPT_SECRET: ${RECEIPT_SECRET:-stand-v1-public-dev-secret}
+      OFFER_WINDOW_SECONDS: ${OFFER_WINDOW_SECONDS:-600}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if b'\"ok\"' in urllib.request.urlopen('http://127.0.0.1:8090/audit/health', timeout=2).read() else 1)"
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
