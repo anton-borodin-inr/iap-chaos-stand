@@ -1,0 +1,10 @@
+.DS_Store
+.idea/
+__pycache__/
+*.pyc
+.venv/
+*.db
+.gradle/
+build/
+local.properties
+*.apk

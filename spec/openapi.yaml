@@ -1,0 +1,667 @@
+openapi: 3.1.0
+info:
+  title: IAP Chaos Stand — public API (backend and fake store)
+  version: stand-v1
+  description: |
+    Public API of the stand. One HTTP origin serves two isolated modules:
+
+    * **backend**: players, game actions, catalog, receipt validation.
+    * **store**: the fake app store, under the `/store` prefix.
+
+    The two modules share no code and no database. The only things they share are
+    the signing secret and the wire formats of the player token and the receipt,
+    both defined below.
+
+    The client talks to one base URL (`backend_url`, see launch.md). The service
+    audit API is separate and is not part of this document (see audit-api.md).
+
+    ## Conventions
+
+    * Bodies are JSON (`application/json; charset=utf-8`).
+    * Timestamps are RFC 3339 UTC with milliseconds, for example `2026-11-10T12:00:00.123Z`.
+    * IDs (`player_id`, `transaction_id`, `install_id`, `batch_id`, `spend_id`,
+      `idempotency_key`) are lowercase UUID v4 strings.
+    * Every error has the body `{"error": {"code": "...", "message": "..."}}`.
+      `code` is stable and listed per operation. `message` is free text.
+    * Request validation failures return `422 VALIDATION_ERROR`.
+    * Unhandled server errors return `500 INTERNAL`.
+    * `/docs`, `/redoc` and `/openapi.json` are not served.
+
+    ## Authentication
+
+    Every operation except `POST /players` needs `Authorization: Bearer <token>`.
+    The backend issues the token. Backend and store both verify it with the shared secret:
+
+    ```
+    token = "v1." + player_id + "." + hex(HMAC_SHA256(secret, "player.v1." + player_id))
+    ```
+
+    The client may parse `player_id` out of the token. A token with a bad format or
+    signature gets `401 UNAUTHORIZED`. The backend also answers `401 PLAYER_NOT_FOUND`
+    when the signature is valid but the player does not exist, for example after a reset.
+    The store does not know players. It accepts any correctly signed token.
+
+    ## Receipt
+
+    The store issues a receipt for each transaction:
+
+    ```
+    payload   = base64url_nopad(utf8(json(ReceiptPayload)))
+    signature = hex(HMAC_SHA256(secret, "receipt.v1." + payload))
+    ```
+
+    The signature covers the exact `payload` string, so verification never re-serializes
+    JSON. The client may decode `payload` (it is not secret) and must treat
+    `payload.transaction_id` as the canonical transaction ID (see purchase-flow.md).
+
+    ## Idempotency
+
+    Every mutating operation is idempotent by a key that the client generates:
+
+    | Operation | Key |
+    | --- | --- |
+    | `POST /players` | `install_id` |
+    | `POST /taps/sync` | `batch_id` |
+    | `POST /spend` | `spend_id` (only successful spends are recorded) |
+    | `POST /purchases/validate` | `transaction_id` inside the receipt |
+    | `POST /store/purchases` | `(player, idempotency_key)` |
+    | `POST /store/purchases/{id}/acknowledge` | `transaction_id` |
+
+    A repeat with the same key and the same body returns the stored result and has
+    no new effect. A repeat with the same key and a different body returns
+    `409 IDEMPOTENCY_CONFLICT`. Concurrent duplicates are serialized: exactly one
+    request applies the effect, and the others return its result.
+servers:
+  - url: "{backend_url}"
+    variables:
+      backend_url:
+        default: http://10.0.2.2:8080
+        description: Base URL passed to the client as launch parameter `backend_url`.
+
+tags:
+  - name: players
+  - name: game
+  - name: catalog
+  - name: purchases
+    description: Backend receipt validation.
+  - name: store
+    description: Fake app store.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /players:
+    post:
+      tags: [players]
+      operationId: registerPlayer
+      summary: Register a guest player (idempotent by install_id)
+      description: |
+        Creates a guest player for `install_id`, or returns the existing one.
+        Repeats with the same `install_id` return the same `player_id` and `token`.
+        This also lets the client recover from a lost or corrupted token
+        (see purchase-flow.md, "401 handling").
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterRequest" }
+      responses:
+        "200":
+          description: Player registered or already existed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RegisterResponse" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /player:
+    get:
+      tags: [players]
+      operationId: getPlayer
+      summary: Current player snapshot
+      responses:
+        "200":
+          description: Snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Player" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /catalog:
+    get:
+      tags: [catalog]
+      operationId: getCatalog
+      summary: Products, prices and starter offer state for this player
+      responses:
+        "200":
+          description: Catalog.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Catalog" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /taps/sync:
+    post:
+      tags: [game]
+      operationId: syncTaps
+      summary: Credit a batch of taps (idempotent by batch_id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TapBatchRequest" }
+      responses:
+        "200":
+          description: |
+            Batch credited, or already credited earlier (`duplicate: true`).
+            A duplicate returns the original `credited_coins` and the current snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TapBatchResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`IDEMPOTENCY_CONFLICT`: the same `batch_id` was used with a different `taps`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /spend:
+    post:
+      tags: [game]
+      operationId: spend
+      summary: Buy an upgrade (coins) or a booster (crystals); idempotent by spend_id
+      description: |
+        A successful spend is recorded under `spend_id`. A repeat returns the
+        original result with `duplicate: true`. A rejected spend (`409`) is not
+        recorded: a repeat with the same `spend_id` is evaluated again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SpendRequest" }
+      responses:
+        "200":
+          description: 'Spend applied, or already applied earlier (`duplicate: true`).'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SpendResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: |
+            * `INSUFFICIENT_FUNDS`: the balance is lower than the cost. Nothing changed.
+            * `MAX_LEVEL`: upgrade requested at level 10. Nothing changed.
+            * `IDEMPOTENCY_CONFLICT`: the same `spend_id` was used with a different `item`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /purchases/validate:
+    post:
+      tags: [purchases]
+      operationId: validatePurchase
+      summary: Verify a receipt and grant the product (idempotent by transaction_id)
+      description: |
+        The backend does not call the store. It checks, in this order:
+
+        1. `receipt.payload` decodes to a valid `ReceiptPayload`, else `400 MALFORMED_RECEIPT`.
+        2. The signature matches, else `400 INVALID_SIGNATURE`.
+        3. `payload.player_id` equals the authenticated player, else `403 RECEIPT_PLAYER_MISMATCH`.
+        4. `payload.sku` is in the catalog, else `400 UNKNOWN_SKU`.
+        5. In one database transaction:
+           * If a grant for `transaction_id` exists, return it with `duplicate: true`
+             and the current snapshot. Nothing new is granted.
+           * Else, if `sku` is one-time and the player already has a grant for it,
+             return `409 OFFER_ALREADY_OWNED`. This cannot happen while the store is correct.
+           * Else, write one `purchase_grant` journal entry, update the balances and
+             return `duplicate: false`.
+
+        The backend does not know whether the store transaction is acknowledged.
+        A transaction that was acknowledged but never granted is granted here.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ValidateRequest" }
+      responses:
+        "200":
+          description: 'Granted now (`duplicate: false`) or earlier (`duplicate: true`).'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ValidateResponse" }
+        "400":
+          description: "`MALFORMED_RECEIPT`, `INVALID_SIGNATURE` or `UNKNOWN_SKU`. Nothing granted."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`RECEIPT_PLAYER_MISMATCH`: the receipt belongs to another player. Nothing granted."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "`OFFER_ALREADY_OWNED`: a second one-time grant was refused. Nothing granted."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /store/purchases:
+    post:
+      tags: [store]
+      operationId: createStorePurchase
+      summary: Charge the player and create a pending transaction (idempotent by idempotency_key)
+      description: |
+        The store resolves the player from the token. In one database transaction:
+
+        1. If a transaction with this `(player, idempotency_key)` exists:
+           the same `sku` returns it (`200`, current status); a different `sku`
+           returns `409 IDEMPOTENCY_CONFLICT`.
+        2. If `sku` is unknown, return `400 UNKNOWN_SKU`.
+        3. If `sku` is one-time and the player already has any transaction for it,
+           return `409 ALREADY_PURCHASED`.
+        4. Otherwise, create a transaction in status `pending` with a signed receipt (`201`).
+
+        The store never checks the starter offer timer.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePurchaseRequest" }
+      responses:
+        "200":
+          description: Existing transaction for this idempotency key (a repeat).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StoreTransaction" }
+        "201":
+          description: New transaction created. The player has been charged.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StoreTransaction" }
+        "400":
+          description: "`UNKNOWN_SKU`. Nothing charged."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: |
+            * `ALREADY_PURCHASED`: a one-time product was already bought under another key. Nothing charged.
+            * `IDEMPOTENCY_CONFLICT`: the same key was used with a different `sku`. Nothing charged.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "500": { $ref: "#/components/responses/Internal" }
+    get:
+      tags: [store]
+      operationId: listStorePurchases
+      summary: The player's store transactions, oldest first
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/StoreTransactionStatus" }
+          description: Filter by status. Leave it out to get all transactions.
+      responses:
+        "200":
+          description: List.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StoreTransactionList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /store/purchases/{transaction_id}:
+    get:
+      tags: [store]
+      operationId: getStorePurchase
+      summary: One transaction with a fresh copy of its receipt
+      parameters:
+        - $ref: "#/components/parameters/TransactionId"
+      responses:
+        "200":
+          description: Transaction.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StoreTransaction" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/TransactionNotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /store/purchases/{transaction_id}/acknowledge:
+    post:
+      tags: [store]
+      operationId: acknowledgeStorePurchase
+      summary: Close the transaction (idempotent)
+      description: |
+        Sets status `acknowledged` and `acknowledged_at`. Acknowledging an
+        already acknowledged transaction returns `200` with the original
+        `acknowledged_at`. The store does not check whether the backend granted
+        the purchase. The client acknowledges only after a successful validation.
+      parameters:
+        - $ref: "#/components/parameters/TransactionId"
+      responses:
+        "200":
+          description: Transaction, now acknowledged.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StoreTransaction" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/TransactionNotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: "v1.<player_id>.<hex hmac>"
+
+  parameters:
+    TransactionId:
+      name: transaction_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/Uuid" }
+
+  responses:
+    Unauthorized:
+      description: "`UNAUTHORIZED` (missing, malformed or wrongly signed token) or `PLAYER_NOT_FOUND` (backend only)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: "`VALIDATION_ERROR`: the request does not match the schema."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Internal:
+      description: "`INTERNAL`: unhandled server error. Nothing was committed."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TransactionNotFound:
+      description: "`TRANSACTION_NOT_FOUND`: no such transaction for this player."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+      pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+
+    Timestamp:
+      type: string
+      format: date-time
+      description: RFC 3339 UTC with milliseconds.
+
+    Sku:
+      type: string
+      enum: [crystals_small, crystals_medium, crystals_large, starter_offer]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - VALIDATION_ERROR
+                - UNAUTHORIZED
+                - PLAYER_NOT_FOUND
+                - IDEMPOTENCY_CONFLICT
+                - INSUFFICIENT_FUNDS
+                - MAX_LEVEL
+                - MALFORMED_RECEIPT
+                - INVALID_SIGNATURE
+                - UNKNOWN_SKU
+                - RECEIPT_PLAYER_MISMATCH
+                - OFFER_ALREADY_OWNED
+                - ALREADY_PURCHASED
+                - TRANSACTION_NOT_FOUND
+                - INTERNAL
+            message:
+              type: string
+
+    RegisterRequest:
+      type: object
+      required: [install_id]
+      additionalProperties: false
+      properties:
+        install_id:
+          $ref: "#/components/schemas/Uuid"
+          description: The client generates it once per install and keeps it until app data is cleared.
+
+    RegisterResponse:
+      type: object
+      required: [player_id, token, player]
+      properties:
+        player_id: { $ref: "#/components/schemas/Uuid" }
+        token:
+          type: string
+          description: Bearer token. Its `player_id` part equals `player_id`.
+        player: { $ref: "#/components/schemas/Player" }
+
+    Player:
+      type: object
+      description: |
+        Full player snapshot. Every mutating backend response embeds one.
+        `version` is the `entry_id` of the player's latest journal entry (0 if
+        there is none). It grows with every balance change, so the client uses
+        it to ignore older snapshots.
+      required: [player_id, coins, crystals, upgrade, booster, offer, version, server_time]
+      properties:
+        player_id: { $ref: "#/components/schemas/Uuid" }
+        coins: { type: integer, minimum: 0 }
+        crystals: { type: integer, minimum: 0 }
+        upgrade:
+          type: object
+          required: [level, tap_income, next_cost]
+          properties:
+            level: { type: integer, minimum: 1, maximum: 10 }
+            tap_income: { type: integer, minimum: 1, description: Coins per normal tap. }
+            next_cost:
+              type: [integer, "null"]
+              description: Coins for the next level. `null` at level 10.
+        booster:
+          type: object
+          required: [charges, cost_crystals, charges_per_purchase]
+          properties:
+            charges: { type: integer, minimum: 0 }
+            cost_crystals: { type: integer, const: 50 }
+            charges_per_purchase: { type: integer, const: 100 }
+        offer: { $ref: "#/components/schemas/OfferState" }
+        version: { type: integer, minimum: 0 }
+        server_time: { $ref: "#/components/schemas/Timestamp" }
+
+    OfferState:
+      type: object
+      required: [sku, expires_at, status]
+      properties:
+        sku: { type: string, const: starter_offer }
+        expires_at: { $ref: "#/components/schemas/Timestamp" }
+        status:
+          type: string
+          enum: [available, expired, purchased]
+
+    Grant:
+      type: object
+      required: [coins, crystals]
+      properties:
+        coins: { type: integer, minimum: 0 }
+        crystals: { type: integer, minimum: 0 }
+
+    Product:
+      type: object
+      required: [sku, title, price_cents, currency, grant, one_time, offer]
+      properties:
+        sku: { $ref: "#/components/schemas/Sku" }
+        title: { type: string }
+        price_cents: { type: integer, minimum: 1 }
+        currency: { type: string, const: USD }
+        grant: { $ref: "#/components/schemas/Grant" }
+        one_time: { type: boolean }
+        offer:
+          oneOf:
+            - { $ref: "#/components/schemas/OfferState" }
+            - { type: "null" }
+          description: Present only for `starter_offer`.
+
+    Catalog:
+      type: object
+      required: [server_time, products]
+      properties:
+        server_time: { $ref: "#/components/schemas/Timestamp" }
+        products:
+          type: array
+          description: Always the four products of game.md, in the order small, medium, large, offer.
+          items: { $ref: "#/components/schemas/Product" }
+
+    TapBatchRequest:
+      type: object
+      required: [batch_id, taps]
+      additionalProperties: false
+      properties:
+        batch_id: { $ref: "#/components/schemas/Uuid" }
+        taps: { type: integer, minimum: 1, maximum: 200 }
+
+    TapBatchResponse:
+      type: object
+      required: [batch_id, taps, credited_coins, duplicate, player]
+      properties:
+        batch_id: { $ref: "#/components/schemas/Uuid" }
+        taps: { type: integer }
+        credited_coins: { type: integer, minimum: 0 }
+        duplicate: { type: boolean }
+        player: { $ref: "#/components/schemas/Player" }
+
+    SpendRequest:
+      type: object
+      required: [spend_id, item]
+      additionalProperties: false
+      properties:
+        spend_id: { $ref: "#/components/schemas/Uuid" }
+        item:
+          type: string
+          enum: [upgrade, booster]
+
+    SpendResponse:
+      type: object
+      required: [spend_id, item, cost, duplicate, player]
+      properties:
+        spend_id: { $ref: "#/components/schemas/Uuid" }
+        item: { type: string, enum: [upgrade, booster] }
+        cost: { $ref: "#/components/schemas/Grant" }
+        duplicate: { type: boolean }
+        player: { $ref: "#/components/schemas/Player" }
+
+    Receipt:
+      type: object
+      required: [payload, signature]
+      additionalProperties: false
+      properties:
+        payload:
+          type: string
+          description: base64url without padding of the UTF-8 JSON `ReceiptPayload`.
+        signature:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+
+    ReceiptPayload:
+      type: object
+      description: Decoded `Receipt.payload`. It is not sent as a separate field.
+      required: [v, transaction_id, player_id, sku, quantity, purchased_at]
+      properties:
+        v: { type: integer, const: 1 }
+        transaction_id: { $ref: "#/components/schemas/Uuid" }
+        player_id: { $ref: "#/components/schemas/Uuid" }
+        sku: { $ref: "#/components/schemas/Sku" }
+        quantity: { type: integer, const: 1 }
+        purchased_at: { $ref: "#/components/schemas/Timestamp" }
+
+    ValidateRequest:
+      type: object
+      required: [receipt]
+      additionalProperties: false
+      properties:
+        receipt: { $ref: "#/components/schemas/Receipt" }
+
+    ValidateResponse:
+      type: object
+      required: [transaction_id, sku, grant, duplicate, player]
+      properties:
+        transaction_id:
+          $ref: "#/components/schemas/Uuid"
+          description: Equals `payload.transaction_id` of the validated receipt.
+        sku: { $ref: "#/components/schemas/Sku" }
+        grant: { $ref: "#/components/schemas/Grant" }
+        duplicate:
+          type: boolean
+          description: "`true` if the grant was made by an earlier validation."
+        player: { $ref: "#/components/schemas/Player" }
+
+    CreatePurchaseRequest:
+      type: object
+      required: [sku, idempotency_key]
+      additionalProperties: false
+      properties:
+        sku: { $ref: "#/components/schemas/Sku" }
+        idempotency_key:
+          $ref: "#/components/schemas/Uuid"
+          description: The client generates one key per press of a buy button and reuses it for every retry of that purchase.
+
+    StoreTransactionStatus:
+      type: string
+      enum: [pending, acknowledged]
+      description: "`pending` means paid but not closed. `acknowledged` means closed by the client."
+
+    StoreTransaction:
+      type: object
+      required:
+        [transaction_id, player_id, sku, quantity, price_cents, currency, status,
+         idempotency_key, created_at, acknowledged_at, receipt]
+      properties:
+        transaction_id: { $ref: "#/components/schemas/Uuid" }
+        player_id: { $ref: "#/components/schemas/Uuid" }
+        sku: { $ref: "#/components/schemas/Sku" }
+        quantity: { type: integer, const: 1 }
+        price_cents: { type: integer }
+        currency: { type: string, const: USD }
+        status: { $ref: "#/components/schemas/StoreTransactionStatus" }
+        idempotency_key: { $ref: "#/components/schemas/Uuid" }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        acknowledged_at:
+          oneOf:
+            - { $ref: "#/components/schemas/Timestamp" }
+            - { type: "null" }
+        receipt: { $ref: "#/components/schemas/Receipt" }
+
+    StoreTransactionList:
+      type: object
+      required: [player_id, transactions]
+      properties:
+        player_id:
+          $ref: "#/components/schemas/Uuid"
+          description: The player resolved from the token.
+        transactions:
+          type: array
+          description: Ordered by `created_at` ascending.
+          items: { $ref: "#/components/schemas/StoreTransaction" }
