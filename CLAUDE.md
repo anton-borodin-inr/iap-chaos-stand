@@ -45,7 +45,7 @@ These rules are not optional.
 ## Design rules
 
 - The balance is server-authoritative. The client shows server values, plus an estimate of unsynced tap income for coins only.
-- Backend and store are two strictly separated modules in one process. They share no code, no tables and no database file; only the signing secret and the documented wire formats. The store must be able to move to its own container later.
+- Backend and store are two strictly separated modules in one process (`server/stand/backend`, `server/stand/store`). They share no domain code, no tables and no database file; only the signing secret and the documented wire formats. Generic helpers in `server/stand/` (clock, SQLite wrapper, error envelope) are the only shared code. The store must be able to move to its own container later.
 - Balances are stored columns, changed in the same SQLite transaction as their journal entry.
 - Every mutating request is idempotent by a client-generated key. See the table in `spec/openapi.yaml`.
 - The client follows the retry, deadline and recovery rules of `spec/purchase-flow.md` exactly. Its constants are part of the contract.
@@ -61,6 +61,14 @@ Defects are what the tool is meant to find. Every defect must meet these require
 - Turned on by one toggle ID (see `spec/launch.md`), and leaves no trace in traffic.
 - Lives in one place in the code, and has been reproduced by hand at least once.
 - Lives in the client or the backend, never in the fake store.
+
+## Commands
+
+- Server image: `docker build -f server/Dockerfile -t iap-chaos-stand/server:stand-v1 .`
+- Server: `STAND_DEFECTS=<ids> docker compose up -d --wait`
+- Client: `cd client && ./gradlew :app:assembleDebug`
+- Tests: `.venv/bin/pytest tests/happy tests/contract`. They start a local server unless `STAND_URL` and `STAND_AUDIT_URL` are set. The Appium scenario needs `APPIUM_URL`.
+- Manual fault reproduction: `tests/support/fault_proxy.py`. It is a stand-repo helper, not the tool.
 
 ## Tests
 
